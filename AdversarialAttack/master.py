@@ -1,7 +1,7 @@
-#from utils.dispatcher import dispatcher
+from utils.dispatcher import dispatcher
 from config.config_paths import general_paths
 from config.config_general import general_constant
-from utils.black_box_model import evaluate_zhang
+#from utils.black_box_model import evaluate_zhang
 from utils.parse_results import parse_results, compare_results
 # from utils.model import *
 import warnings
@@ -34,6 +34,8 @@ def print_menu():
     print("15) Print Zhang original evaluation statistics")
     print("16) Print Zhang patched evaluation statistics")
     print("17) Compare Zhang patched and original evaluation statistics")
+    print("18) Start the combo attack")
+    print("19) Statistics on attack")
     print("0) Exit")
 
 
@@ -84,7 +86,15 @@ def menu():
         choice = input("> ")
         choice = choice.replace('\n', '')
 
-        if choice == '1':
+        if choice == '1' or choice == '18' or choice == '19':
+            if choice == '1':
+                mode = 'attack'
+            elif choice == '18':
+                mode = 'combo_attack'
+            elif choice == '19':
+                mode = 'stats'
+
+
             # Attack the test set with our strategy
         
             features_path = os.path.join(general_paths['features_dir'], general_paths['original_features_filename'])
@@ -112,8 +122,8 @@ def menu():
             print(f"min_valid_apis: {general_constant['min_valid_apis']},")
 
             input("Press Enter to continue... (Ctrl+C to stop the attack)")
-
-            dispatcher('attack')
+            
+            dispatcher(mode)
         
         elif choice == '2':
             features_path = os.path.join(general_paths['features_dir'], general_paths['patched_features_filename'])
@@ -273,10 +283,12 @@ def menu():
             print_comparison_375_end_to_end(filename1, filename2)
             print_375_end_to_end_evasion_score(filename1, filename2)
         elif choice == '13':
+            from utils.black_box_model import evaluate_zhang
             original_features_path = os.path.join(general_paths['features_dir'], general_paths['zhang_original_features_dir'])
             original_results_path   = os.path.join(general_paths['evaluation_dir'], general_paths['zhang_original_results_filename'])
             evaluate_zhang(original_features_path, original_results_path)
         elif choice == '14':
+            from utils.black_box_model import evaluate_zhang
             patched_features_path = os.path.join(general_paths['features_dir'], general_paths['zhang_patched_features_dir'])
             patched_results_path   = os.path.join(general_paths['evaluation_dir'], general_paths['zhang_patched_results_filename'])
             evaluate_zhang(patched_features_path, patched_results_path)
@@ -290,6 +302,7 @@ def menu():
             original_results_path   = os.path.join(general_paths['evaluation_dir'], general_paths['zhang_original_results_filename'])
             patched_results_path   = os.path.join(general_paths['evaluation_dir'], general_paths['zhang_patched_results_filename'])
             compare_results(original_results_path, patched_results_path)
+
         elif choice == '0':
             quit()
         else:

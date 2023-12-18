@@ -74,11 +74,12 @@ def compare_results(results_path_original, results_path_patched):
         if malware_count > lenght / 2:
             majority_vote += 1
             single_vote += 1
-            malware_to_compare.append(key)
+            
         elif malware_count > 0:
             single_vote += 1
 
         if malware_count == lenght:
+            malware_to_compare.append(key)
             total_vote += 1
 
         if benigh_count > 0:
@@ -97,12 +98,19 @@ def compare_results(results_path_original, results_path_patched):
     with open(results_path_patched, 'r') as f:
         results = json.load(f)
 
+    print("Malware to compare: ", len(malware_to_compare))
+    print("Total malware after: ", len(results))
+
+
+    sample_counter = 0
     for key, value in results.items():
 
         # Check if we need to check the modified version of
         # the malware
         if key not in malware_to_compare:
             continue
+
+        sample_counter += 1
 
         lenght = len(value)
         malware_count = value.count(1)
@@ -123,15 +131,24 @@ def compare_results(results_path_original, results_path_patched):
         if benigh_count > 0:
             benign_at_least_once +=1
     print("The number of malware according to majority vote: ", majority_vote)
-    print(f"{majority_vote} / {len(malware_to_compare)} \t {majority_vote / len(malware_to_compare) * 100}%")
+    print(f"{majority_vote} / {sample_counter} \t {majority_vote / sample_counter * 100}%")
 
     print("The number of malware according to single vote: ", single_vote)
-    print(f"{single_vote} / {len(malware_to_compare)} \t {single_vote / len(malware_to_compare) * 100}%")
+    print(f"{single_vote} / {sample_counter} \t {single_vote / sample_counter * 100}%")
 
     print("The number of benign at least once: ", benign_at_least_once)
-    print(f"{benign_at_least_once} / {len(malware_to_compare)} \t {benign_at_least_once / len(malware_to_compare) * 100}%")
+    print(f"{benign_at_least_once} / {sample_counter} \t {benign_at_least_once / sample_counter * 100}%")
 
     print("The number of malware according to total vote: ", total_vote)
-    print(f"{total_vote} / {len(malware_to_compare)} \t {total_vote / len(malware_to_compare) * 100}%")
+    print(f"{total_vote} / {sample_counter} \t {total_vote / sample_counter * 100}%")
 
     print(f"Overall accuracy: {total_malware_count / total_execution_count * 100}%")
+
+    print(f"Overall attack effectiveness: {100 - total_malware_count / total_execution_count * 100}%")
+
+    print("Total number of samples: ", sample_counter)
+
+    print("Total number of malware: ", total_malware_count)
+
+    print("Total number of executions: ", total_execution_count)
+

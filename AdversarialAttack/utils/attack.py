@@ -13,8 +13,11 @@ from ChainFramework.config.config_api_args import api_args as chain_api_args
 import numpy as np
 import math
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import logging
 import time
+import __main__
 
 def compute_entropy(file_path):
     """Compute the entropy of a file"""
@@ -173,7 +176,7 @@ def compute_best_position(jacobian_names, total_names, sample_name, position_ub)
             norm_jacobian[argmax] = -1            
 
         count += 1
-        if count > len(total_names):
+        if count > min(len(total_names), 999):
             # Fail if we cannot find a position after checking them all
             raise CannotFindBestPositionException("Cannot compute the best position - iterated")
         
@@ -297,6 +300,223 @@ def adversarial_sequence_generation(api_sequence, model, api_set, mode, called_a
     
     logger.debug(f'[{sample_name[:]}] Started' )
 
+    while original_names.shape[1] != 0:
+        # Add padding to the sequences
+        padding_behaviors  = torch.tensor([24, 14, 14, 14] * (1000-original_names.shape[1]), dtype = int)
+        padding_behaviors  = torch.unsqueeze(padding_behaviors, 0)
+        original_names     = torch.nn.functional.pad(input=original_names, pad=(0, (1000-original_names.shape[1])), mode='constant', value=0)
+        original_behaviors = torch.cat((original_behaviors, padding_behaviors), dim = 1)
+        
+        # Initialize the variables that stores all the APIs in the total sequence as pair.
+        # The first binary element shows if:
+        #  - they belong to the original sequence (0) or
+        #  - they have been injected by the tool (1) 
+        #  - they probably belong to the loader (2) 
+        total_names     = np.array(list(map(lambda x: [2 if id2word[int(x)].encode() not in called_apis else 0, x], original_names[0])))
+        total_behaviors = np.split(original_behaviors, 1000, axis = 1)
+        total_behaviors = np.array(list(map(lambda x: [0, np.array(x[0])], total_behaviors)), dtype = object)
+
+        # Send data to device
+        original_names     = original_names.to(device)
+        original_behaviors = original_behaviors.to(device)
+
+        # Embed using the model ebedding layers
+        embedded_names = model.embedder1(original_names)
+        embedded_behaviors = model.embedder2(original_behaviors)
+
+
+        # Compute the Jacobian sign
+        position, sign_jacobian_names, sign_jacobian_behaviors = compute_jacobian(
+                model, embedded_names, embedded_behaviors, 
+                total_names, sample_name, position_ub)
+
+        # Repeat M times the Jacobian sign to allow fast difference computation
+        # M = number of apis to try
+        if mode == 'names':
+            sign_jacobian_names_repeated     = np.repeat(sign_jacobian_names, len(api_set), axis = 0)
+        elif mode == 'behaviors':
+            sign_jacobian_behaviors_repeated = np.repeat(sign_jacobian_behaviors, len(api_set), axis = 0)
+        else:
+            raise('Wrong mode')
+        
+        # Send back to CPU
+        embedded_names = embedded_names.to('cpu').detach().numpy()
+        embedded_behaviors = embedded_behaviors.to('cpu').detach().numpy()
+
+        it_counter = 0
+        score_dict = {}
+        while it_counter < max_num_iterations:  
+
+
+            # Update iteractions counter
+            it_counter += 1
+
+            current_score = model.single_score(embedded_names, embedded_behaviors)
+
+            score_dict[current_score] = [total_names, total_behaviors]
+                
+            # Generate a new API name and behavior sequence for each API call we want to try to inject
+            new_embedded_names     = new_embedded_names_given_index(embedded_names, position, api_set_name_id)
+            new_embedded_behaviors = new_embedded_behaviors_given_index(embedded_behaviors, position, api_set_behavior_id)
+
+            # Repeat M times the original sequences to allow fast difference computation
+            # M = number of apis to try
+            embedded_names_repeated     = np.repeat(embedded_names, len(api_set), axis = 0)
+            embedded_behaviors_repeated = np.repeat(embedded_behaviors, len(api_set), axis = 0)
+
+            #print(f'Before sub (names) {embedded_names_repeated.shape} - {new_embedded_names.shape}')
+            #print(f'Before sub (behaviors) {embedded_behaviors_repeated.shape} - {new_embedded_behaviors.shape}')
+
+            if mode == 'names':
+                # Compute the sign of the difference between the previous embedded names sequence and each of the new 
+                # generated embedded names sequence
+                sub_embedded_names      = np.subtract(embedded_names_repeated, new_embedded_names)
+                sign_sub_embedded_names = np.sign(sub_embedded_names)
+                
+                # Compute the difference between the sign of the difference and the sign on the Jacobian
+                sub_signs_names     = np.subtract(sign_sub_embedded_names , sign_jacobian_names_repeated)
+                
+                # Compute the norm of the signs difference
+                norm_sum     = np.linalg.norm(sub_signs_names, ord='fro', axis = (1,2))
+            elif mode == 'behaviors':
+                # Compute the sign of the difference between the previous embedded behaviors sequence and each of the new 
+                # generated embedded behaviors sequence
+                sub_embedded_behaviors      = np.subtract(embedded_behaviors_repeated, new_embedded_behaviors)
+                sign_sub_embedded_behaviors = np.sign(sub_embedded_behaviors)
+               
+                # Compute the difference between the sign of the difference and the sign on the Jacobian
+                sub_signs_behaviors = np.subtract(sign_sub_embedded_behaviors , sign_jacobian_behaviors_repeated)
+                
+                # Compute the norm of the signs difference
+                norm_sum = np.linalg.norm(sub_signs_behaviors, ord='fro' , axis = (1,2))
+            else:
+                raise('Wrong mode')
+
+            # Compute the argmin to decide the API call to inject
+            selected_idx = np.argmin(norm_sum)
+
+            # Set the current sequence equal to the selected ones
+            embedded_names = new_embedded_names[selected_idx]
+            embedded_names = np.expand_dims(embedded_names, axis = 0)
+            embedded_behaviors = new_embedded_behaviors[selected_idx]
+            embedded_behaviors = np.expand_dims(embedded_behaviors, axis = 0)
+
+            # Update the total sequences
+            total_names = np.concatenate((
+                    total_names[:position],
+                    np.array([(1, api_set_name_id[selected_idx])]),
+                    total_names[position:]))
+            total_behaviors = np.concatenate((
+                    total_behaviors[:position],
+                    np.array([(1, api_set_behavior_id[selected_idx])], dtype=object),
+                    total_behaviors[position:]))
+            
+            #n = torch.tensor(list(map(lambda x: x[1], total_names[:1000]))).unsqueeze(0).to(device)
+            #b = torch.tensor(list(map(lambda x: x[1], total_behaviors[:1000]))).flatten().unsqueeze(0).to(device)
+
+            #print(f'single inference: {model.single_inference(embedded_names, embedded_behaviors)}')
+            #print(f'single inference: {model.single_inference(model.embedder1(n).cpu().detach().numpy(), model.embedder2(b).cpu().detach().numpy())}')
+            #print(f'single score: {model.single_score(embedded_names, embedded_behaviors)}')
+            #print(f'pred given split {model.pred_given_split(n, b)}')
+            #print(f'score given split {model.score_given_split(n, b)}')
+
+            # Compute the Jacobian sign
+            position, sign_jacobian_names, sign_jacobian_behaviors = compute_jacobian(
+                    model,
+                    torch.tensor(embedded_names).to(device), 
+                    torch.tensor(embedded_behaviors).to(device),
+                    total_names,
+                    sample_name,
+                    position_ub)
+            
+            
+            # Repeat M times the Jacobian sign to allow fast difference computation
+            # M = number of apis to try
+            sign_jacobian_names_repeated = np.repeat(sign_jacobian_names, len(api_set), axis = 0)
+            sign_jacobian_behaviors_repeated = np.repeat(sign_jacobian_behaviors, len(api_set), axis = 0)
+        
+            # Dynamically adjust the random upperbound
+            position_ub = position_ub + 1 if position_ub < 999 else 999
+
+
+        # Find the key with the smallest floating point value
+        min_key = min(score_dict, key=float)
+
+        if min_key > general_constant['score_threshold']:
+            apis_counter = 9999999
+            break
+        
+        print()
+        print(f'[{sample_name[:]}] Score: {min_key} - Iterations: {it_counter}')
+
+        # Retrieve the corresponding array
+        total_names, total_behaviors = score_dict[min_key]
+
+        # Update the number of injected APIs counter
+        apis_counter += len(list(filter(lambda x: x[0] == 1, total_names[:1000])))
+        
+        output_name_sequence.append(total_names[:1000])
+        total_names = total_names[1000:]
+        total_behaviors = total_behaviors[1000:]
+
+        
+
+        # Ignore the added APIs in the new window and the padding
+        total_names     = np.array(list(filter(lambda x: (x[0] == 0 or x[0] == 2) and int(x[1]) != 0, total_names)))
+        total_behaviors = np.array(list(filter(lambda x: (x[0] == 0 or x[0] == 2) and (np.array([24, 14, 14, 14]) != x[1]).any(), total_behaviors)))
+        
+        # Resize properly and set variables for next iteration
+        original_names = torch.tensor(list(map(lambda x: x[1], total_names)))
+        original_names = torch.unsqueeze(original_names, 0)
+        
+        original_behaviors = torch.tensor(np.array(list(map(lambda x: x[1], total_behaviors))))
+        original_behaviors = torch.flatten(original_behaviors)
+        original_behaviors = torch.unsqueeze(original_behaviors, 0)
+        
+        # Update the random upperbound
+        position_ub = original_names.shape[1] - 1
+                             
+    return apis_counter, output_name_sequence
+
+
+def adversarial_sequence_generation_legacy(api_sequence, model, api_set, mode, called_apis, sample_name, max_num_iterations=1500):
+    logger = logging.getLogger('adversarial_attack')
+    global it_counter
+
+    model.eval()
+
+    # Number of injected APIs counter
+    apis_counter = 0
+
+    # Number of iteractions counter
+    it_counter = 0
+
+    # Final sequence of all API names with the right order
+    output_name_sequence = []
+
+    # Split the original sequence in names and behaviors
+    original_names, original_behaviors = api_sequence.split([1000, 4000], 1)
+
+    # From api name to id
+    api_set_name_id = np.array(list(map(lambda x: word2id[x], api_set)))
+
+    # From api name to behavior
+    api_set_behavior = np.array(list(map(lambda x: word2behavior[x], api_set)))
+
+    # From behavior to behavior id
+    api_set_behavior_id = np.array(list(map(tuple_to_id, api_set_behavior)))
+
+
+    # Initilize the position upperbound
+    position_ub = len(list(filter(lambda x: x!=0, original_names[0])))
+    # print(f'Initial value for the UB: {position_ub}')
+    
+    # Original names is set each time to a window of 1000 APIs: 
+    # when the window.shape[1] (num of API) is 0 it means that 
+    # there are no meaningful (!= PAD) APIs in that window
+    
+    logger.debug(f'[{sample_name[:]}] Started' )
+
     while original_names.shape[1] != 0 and it_counter < max_num_iterations:
         # Add padding to the sequences
         padding_behaviors  = torch.tensor([24, 14, 14, 14] * (1000-original_names.shape[1]), dtype = int)
@@ -323,17 +543,437 @@ def adversarial_sequence_generation(api_sequence, model, api_set, mode, called_a
 
 
         # Compute the Jacobian sign
-        try:
-            position, sign_jacobian_names, sign_jacobian_behaviors = compute_jacobian(
+        position, sign_jacobian_names, sign_jacobian_behaviors = compute_jacobian(
                 model, embedded_names, embedded_behaviors, 
                 total_names, sample_name, position_ub)
-        except CannotFindBestPositionException:
-            # If we cannot find a position to hijack, we stop and return just the first window
-            logger.warning(f'[{sample_name[:]}] Cannot find a position to hijack in the second window, returning only window 1')
-            # apis_counter = len(list(filter(lambda x: x[0] == 1, total_names[:1000])))
-            # output_name_sequence.append(total_names[:1000])
-            return apis_counter, output_name_sequence
 
+        # Repeat M times the Jacobian sign to allow fast difference computation
+        # M = number of apis to try
+        if mode == 'names':
+            sign_jacobian_names_repeated     = np.repeat(sign_jacobian_names, len(api_set), axis = 0)
+        elif mode == 'behaviors':
+            sign_jacobian_behaviors_repeated = np.repeat(sign_jacobian_behaviors, len(api_set), axis = 0)
+        else:
+            raise('Wrong mode')
+        
+        # Send back to CPU
+        embedded_names = embedded_names.to('cpu').detach().numpy()
+        embedded_behaviors = embedded_behaviors.to('cpu').detach().numpy()
+
+        while model.single_inference_thr(embedded_names, embedded_behaviors) != 0 and it_counter < max_num_iterations:     
+            # Update iteractions counter
+            it_counter += 1
+                
+            # Generate a new API name and behavior sequence for each API call we want to try to inject
+            new_embedded_names     = new_embedded_names_given_index(embedded_names, position, api_set_name_id)
+            new_embedded_behaviors = new_embedded_behaviors_given_index(embedded_behaviors, position, api_set_behavior_id)
+
+            # Repeat M times the original sequences to allow fast difference computation
+            # M = number of apis to try
+            embedded_names_repeated     = np.repeat(embedded_names, len(api_set), axis = 0)
+            embedded_behaviors_repeated = np.repeat(embedded_behaviors, len(api_set), axis = 0)
+
+            #print(f'Before sub (names) {embedded_names_repeated.shape} - {new_embedded_names.shape}')
+            #print(f'Before sub (behaviors) {embedded_behaviors_repeated.shape} - {new_embedded_behaviors.shape}')
+
+            if mode == 'names':
+                # Compute the sign of the difference between the previous embedded names sequence and each of the new 
+                # generated embedded names sequence
+                sub_embedded_names      = np.subtract(embedded_names_repeated, new_embedded_names)
+                sign_sub_embedded_names = np.sign(sub_embedded_names)
+                
+                # Compute the difference between the sign of the difference and the sign on the Jacobian
+                sub_signs_names     = np.subtract(sign_sub_embedded_names , sign_jacobian_names_repeated)
+                
+                # Compute the norm of the signs difference
+                norm_sum     = np.linalg.norm(sub_signs_names, ord='fro', axis = (1,2))
+            elif mode == 'behaviors':
+                # Compute the sign of the difference between the previous embedded behaviors sequence and each of the new 
+                # generated embedded behaviors sequence
+                sub_embedded_behaviors      = np.subtract(embedded_behaviors_repeated, new_embedded_behaviors)
+                sign_sub_embedded_behaviors = np.sign(sub_embedded_behaviors)
+               
+                # Compute the difference between the sign of the difference and the sign on the Jacobian
+                sub_signs_behaviors = np.subtract(sign_sub_embedded_behaviors , sign_jacobian_behaviors_repeated)
+                
+                # Compute the norm of the signs difference
+                norm_sum = np.linalg.norm(sub_signs_behaviors, ord='fro' , axis = (1,2))
+            else:
+                raise('Wrong mode')
+
+            # Compute the argmin to decide the API call to inject
+            selected_idx = np.argmin(norm_sum)
+
+            # Set the current sequence equal to the selected ones
+            embedded_names = new_embedded_names[selected_idx]
+            embedded_names = np.expand_dims(embedded_names, axis = 0)
+            embedded_behaviors = new_embedded_behaviors[selected_idx]
+            embedded_behaviors = np.expand_dims(embedded_behaviors, axis = 0)
+
+            # Update the total sequences
+            total_names = np.concatenate((
+                    total_names[:position],
+                    np.array([(1, api_set_name_id[selected_idx])]),
+                    total_names[position:]))
+            total_behaviors = np.concatenate((
+                    total_behaviors[:position],
+                    np.array([(1, api_set_behavior_id[selected_idx])], dtype=object),
+                    total_behaviors[position:]))
+            
+            #n = torch.tensor(list(map(lambda x: x[1], total_names[:1000]))).unsqueeze(0).to(device)
+            #b = torch.tensor(list(map(lambda x: x[1], total_behaviors[:1000]))).flatten().unsqueeze(0).to(device)
+
+            #print(f'single inference: {model.single_inference(embedded_names, embedded_behaviors)}')
+            #print(f'single inference: {model.single_inference(model.embedder1(n).cpu().detach().numpy(), model.embedder2(b).cpu().detach().numpy())}')
+            #print(f'single score: {model.single_score(embedded_names, embedded_behaviors)}')
+            #print(f'pred given split {model.pred_given_split(n, b)}')
+            #print(f'score given split {model.score_given_split(n, b)}')
+
+            # Compute the Jacobian sign
+            position, sign_jacobian_names, sign_jacobian_behaviors = compute_jacobian(
+                    model,
+                    torch.tensor(embedded_names).to(device), 
+                    torch.tensor(embedded_behaviors).to(device),
+                    total_names,
+                    sample_name,
+                    position_ub)
+            
+            
+            # Repeat M times the Jacobian sign to allow fast difference computation
+            # M = number of apis to try
+            sign_jacobian_names_repeated = np.repeat(sign_jacobian_names, len(api_set), axis = 0)
+            sign_jacobian_behaviors_repeated = np.repeat(sign_jacobian_behaviors, len(api_set), axis = 0)
+        
+            # Dynamically adjust the random upperbound
+            position_ub = position_ub + 1 if position_ub < 999 else 999
+
+        # Update the number of injected APIs counter
+        if it_counter == max_num_iterations:
+            apis_counter = 999999999
+            it_counter = 999999999
+            break
+
+        apis_counter += len(list(filter(lambda x: x[0] == 1, total_names[:1000])))
+        it_counter = apis_counter
+        
+        output_name_sequence.append(total_names[:1000])
+        total_names = total_names[1000:]
+        total_behaviors = total_behaviors[1000:]
+
+        # Ignore the added APIs in the new window and the padding
+        total_names     = np.array(list(filter(lambda x: (x[0] == 0 or x[0] == 2) and int(x[1]) != 0, total_names)))
+        total_behaviors = np.array(list(filter(lambda x: (x[0] == 0 or x[0] == 2) and (np.array([24, 14, 14, 14]) != x[1]).any(), total_behaviors)))
+        
+        # Resize properly and set variables for next iteration
+        original_names = torch.tensor(list(map(lambda x: x[1], total_names)))
+        original_names = torch.unsqueeze(original_names, 0)
+        
+        original_behaviors = torch.tensor(np.array(list(map(lambda x: x[1], total_behaviors))))
+        original_behaviors = torch.flatten(original_behaviors)
+        original_behaviors = torch.unsqueeze(original_behaviors, 0)
+        
+        # Update the random upperbound
+        position_ub = original_names.shape[1] - 1
+                             
+    
+    return apis_counter, output_name_sequence
+
+
+def combo_adversarial_sequence_generation(api_sequence, model, api_set, mode, called_apis, sample_name, max_num_iterations=1500):
+    logger = logging.getLogger('adversarial_attack')
+    global it_counter
+
+    model.eval()
+
+    # Number of injected APIs counter
+    apis_counter = 0
+
+    # Number of iteractions counter
+    it_counter = 0
+
+    # Final sequence of all API names with the right order
+    output_name_sequence = []
+
+    # Split the original sequence in names and behaviors
+    original_names = api_sequence[0]
+    original_behaviors = api_sequence[1]
+
+    # From api name to id
+    api_set_name_id = np.array(list(map(lambda x: word2id[x], api_set)))
+
+    # From api name to behavior
+    api_set_behavior = np.array(list(map(lambda x: word2behavior[x], api_set)))
+
+    # From behavior to behavior id
+    api_set_behavior_id = np.array(list(map(tuple_to_id, api_set_behavior)))
+
+    # Initilize the position upperbound
+    position_ub = min(len(list(filter(lambda x: x!=0, original_names[0]))), 999)
+    # print(f'Initial value for the UB: {position_ub}')
+    
+    # Original names is set each time to a window of 1000 APIs: 
+    # when the window.shape[1] (num of API) is 0 it means that 
+    # there are no meaningful (!= PAD) APIs in that window
+    
+    logger.debug(f'[{sample_name[:]}] Started' )
+    #print('start')
+    while original_names.shape[1] != 0:
+
+        # Initialize the variables that stores all the APIs in the total sequence as pair.
+        # The first binary element shows if:
+        #  - they belong to the original sequence (0) or
+        #  - they have been injected by the tool (1) 
+        #  - they probably belong to the loader (2) 
+        total_names     = np.array(list(map(lambda x: [2 if id2word[int(x)].encode() not in called_apis else 0, x], original_names[0])))
+        total_behaviors = np.split(original_behaviors, original_behaviors.shape[1]//4, axis = 1)
+        total_behaviors = np.array(list(map(lambda x: [0, np.array(x[0])], total_behaviors)), dtype = object)
+
+        if original_names.shape[1] <= 1000:
+            # Add padding to the sequences
+            padding_behaviors  = torch.tensor([24, 14, 14, 14] * (1000-original_names.shape[1]), dtype = int)
+            padding_behaviors  = torch.unsqueeze(padding_behaviors, 0)
+            original_names     = torch.nn.functional.pad(input=original_names, pad=(0, (1000-original_names.shape[1])), mode='constant', value=0)
+            original_behaviors = torch.cat((original_behaviors, padding_behaviors), dim = 1)
+        else: 
+            original_names = original_names[:, :1000]
+            original_behaviors = original_behaviors[:, :1000*4]
+        
+
+        # Send data to device
+        original_names     = original_names.to(device)
+        original_behaviors = original_behaviors.to(device)
+
+        # Embed using the model ebedding layers
+        embedded_names = model.embedder1(original_names)
+        embedded_behaviors = model.embedder2(original_behaviors)
+
+
+        # Compute the Jacobian sign
+        position, sign_jacobian_names, sign_jacobian_behaviors = compute_jacobian(
+            model, embedded_names, embedded_behaviors, 
+            total_names, sample_name, position_ub)
+    
+        # Repeat M times the Jacobian sign to allow fast difference computation
+        # M = number of apis to try
+        if mode == 'names':
+            sign_jacobian_names_repeated     = np.repeat(sign_jacobian_names, len(api_set), axis = 0)
+        elif mode == 'behaviors':
+            sign_jacobian_behaviors_repeated = np.repeat(sign_jacobian_behaviors, len(api_set), axis = 0)
+        else:
+            raise('Wrong mode')
+        
+        # Send back to CPU
+        embedded_names = embedded_names.to('cpu').detach().numpy()
+        embedded_behaviors = embedded_behaviors.to('cpu').detach().numpy()
+
+        it_counter = 0
+        score_dict = {}
+        while it_counter < max_num_iterations:      
+            # Update iteractions counter
+            it_counter += 1
+
+            current_score = model.single_score(embedded_names, embedded_behaviors)
+
+            score_dict[current_score] = [total_names, total_behaviors]
+                
+            # Generate a new API name and behavior sequence for each API call we want to try to inject
+            new_embedded_names     = new_embedded_names_given_index(embedded_names, position, api_set_name_id)
+            new_embedded_behaviors = new_embedded_behaviors_given_index(embedded_behaviors, position, api_set_behavior_id)
+
+            # Repeat M times the original sequences to allow fast difference computation
+            # M = number of apis to try
+            embedded_names_repeated     = np.repeat(embedded_names, len(api_set), axis = 0)
+            embedded_behaviors_repeated = np.repeat(embedded_behaviors, len(api_set), axis = 0)
+
+            #print(f'Before sub (names) {embedded_names_repeated.shape} - {new_embedded_names.shape}')
+            #print(f'Before sub (behaviors) {embedded_behaviors_repeated.shape} - {new_embedded_behaviors.shape}')
+
+            if mode == 'names':
+                # Compute the sign of the difference between the previous embedded names sequence and each of the new 
+                # generated embedded names sequence
+                sub_embedded_names      = np.subtract(embedded_names_repeated, new_embedded_names)
+                sign_sub_embedded_names = np.sign(sub_embedded_names)
+                
+                # Compute the difference between the sign of the difference and the sign on the Jacobian
+                sub_signs_names     = np.subtract(sign_sub_embedded_names , sign_jacobian_names_repeated)
+                
+                # Compute the norm of the signs difference
+                norm_sum     = np.linalg.norm(sub_signs_names, ord='fro', axis = (1,2))
+            elif mode == 'behaviors':
+                # Compute the sign of the difference between the previous embedded behaviors sequence and each of the new 
+                # generated embedded behaviors sequence
+                sub_embedded_behaviors      = np.subtract(embedded_behaviors_repeated, new_embedded_behaviors)
+                sign_sub_embedded_behaviors = np.sign(sub_embedded_behaviors)
+               
+                # Compute the difference between the sign of the difference and the sign on the Jacobian
+                sub_signs_behaviors = np.subtract(sign_sub_embedded_behaviors , sign_jacobian_behaviors_repeated)
+                
+                # Compute the norm of the signs difference
+                norm_sum = np.linalg.norm(sub_signs_behaviors, ord='fro' , axis = (1,2))
+            else:
+                raise('Wrong mode')
+
+            # Compute the argmin to decide the API call to inject
+            selected_idx = np.argmin(norm_sum)
+
+            # Set the current sequence equal to the selected ones
+            embedded_names = new_embedded_names[selected_idx]
+            embedded_names = np.expand_dims(embedded_names, axis = 0)
+            embedded_behaviors = new_embedded_behaviors[selected_idx]
+            embedded_behaviors = np.expand_dims(embedded_behaviors, axis = 0)
+
+            # Update the total sequences
+            total_names = np.concatenate((
+                    total_names[:position],
+                    np.array([(1, api_set_name_id[selected_idx])]),
+                    total_names[position:]))
+            total_behaviors = np.concatenate((
+                    total_behaviors[:position],
+                    np.array([(1, api_set_behavior_id[selected_idx])], dtype=object),
+                    total_behaviors[position:]))
+            
+            #n = torch.tensor(list(map(lambda x: x[1], total_names[:1000]))).unsqueeze(0)
+            #b = torch.tensor(list(map(lambda x: x[1], total_behaviors[:1000]))).flatten().unsqueeze(0)
+
+            #print(f'single inference: {model.single_inference(embedded_names, embedded_behaviors)}')
+            #print(f'single inference: {model.single_inference(model.embedder1(n).detach().numpy(), model.embedder2(b).detach().numpy())}')
+            #print(f'single score: {model.single_score(embedded_names, embedded_behaviors)}')
+            #print(f'pred given split {model.pred_given_split(n, b)}')
+            #print(f'score given split {model.score_given_split(n, b)}')
+
+
+            # Compute the Jacobian sign
+            position, sign_jacobian_names, sign_jacobian_behaviors = compute_jacobian(
+                    model,
+                    torch.tensor(embedded_names).to(device), 
+                    torch.tensor(embedded_behaviors).to(device),
+                    total_names,
+                    sample_name,
+                    position_ub)
+     
+            
+            # Repeat M times the Jacobian sign to allow fast difference computation
+            # M = number of apis to try
+            sign_jacobian_names_repeated = np.repeat(sign_jacobian_names, len(api_set), axis = 0)
+            sign_jacobian_behaviors_repeated = np.repeat(sign_jacobian_behaviors, len(api_set), axis = 0)
+        
+            # Dynamically adjust the random upperbound
+            position_ub = position_ub + 1 if position_ub < 999 else 999
+
+         # Find the key with the smallest floating point value
+        min_key = min(score_dict, key=float)
+
+        if min_key > general_constant['score_threshold']:
+            apis_counter = 9999999
+            break
+        
+        print()
+        print(f'[{sample_name[:]}] Score: {min_key} - Iterations: {it_counter}')
+
+        total_names, total_behaviors = score_dict[min_key]
+
+
+
+        apis_counter += len(list(filter(lambda x: x[0] == 1, total_names[:1000])))
+        
+        output_name_sequence.append(total_names[:1000])
+        total_names = total_names[1000:]
+        total_behaviors = total_behaviors[1000:]
+
+        # Ignore the added APIs in the new window and the padding
+        total_names     = np.array(list(filter(lambda x: (x[0] == 0 or x[0] == 2) and int(x[1]) != 0, total_names)))
+        total_behaviors = np.array(list(filter(lambda x: (x[0] == 0 or x[0] == 2) and (np.array([24, 14, 14, 14]) != x[1]).any(), total_behaviors)))
+        
+        # Resize properly and set variables for next iteration
+        original_names = torch.tensor(list(map(lambda x: x[1], total_names)))
+        original_names = torch.unsqueeze(original_names, 0)
+        
+        original_behaviors = torch.tensor(np.array(list(map(lambda x: x[1], total_behaviors))))
+        original_behaviors = torch.flatten(original_behaviors)
+        original_behaviors = torch.unsqueeze(original_behaviors, 0)
+        
+        # Update the random upperbound
+        position_ub = original_names.shape[1] - 1
+
+    
+    return apis_counter, output_name_sequence
+
+
+
+def combo_adversarial_sequence_generation_legacy(api_sequence, model, api_set, mode, called_apis, sample_name, max_num_iterations=1500):
+    logger = logging.getLogger('adversarial_attack')
+    global it_counter
+
+    model.eval()
+
+    # Number of injected APIs counter
+    apis_counter = 0
+
+    # Number of iteractions counter
+    it_counter = 0
+
+    # Final sequence of all API names with the right order
+    output_name_sequence = []
+
+    # Split the original sequence in names and behaviors
+    original_names = api_sequence[0]
+    original_behaviors = api_sequence[1]
+
+    # From api name to id
+    api_set_name_id = np.array(list(map(lambda x: word2id[x], api_set)))
+
+    # From api name to behavior
+    api_set_behavior = np.array(list(map(lambda x: word2behavior[x], api_set)))
+
+    # From behavior to behavior id
+    api_set_behavior_id = np.array(list(map(tuple_to_id, api_set_behavior)))
+
+    # Initilize the position upperbound
+    position_ub = min(len(list(filter(lambda x: x!=0, original_names[0]))), 999)
+    # print(f'Initial value for the UB: {position_ub}')
+    
+    # Original names is set each time to a window of 1000 APIs: 
+    # when the window.shape[1] (num of API) is 0 it means that 
+    # there are no meaningful (!= PAD) APIs in that window
+    
+    logger.debug(f'[{sample_name[:]}] Started' )
+    #print('start')
+    while original_names.shape[1] != 0 and it_counter < max_num_iterations:
+
+        # Initialize the variables that stores all the APIs in the total sequence as pair.
+        # The first binary element shows if:
+        #  - they belong to the original sequence (0) or
+        #  - they have been injected by the tool (1) 
+        #  - they probably belong to the loader (2) 
+        total_names     = np.array(list(map(lambda x: [2 if id2word[int(x)].encode() not in called_apis else 0, x], original_names[0])))
+        total_behaviors = np.split(original_behaviors, original_behaviors.shape[1]//4, axis = 1)
+        total_behaviors = np.array(list(map(lambda x: [0, np.array(x[0])], total_behaviors)), dtype = object)
+
+        if original_names.shape[1] <= 1000:
+            # Add padding to the sequences
+            padding_behaviors  = torch.tensor([24, 14, 14, 14] * (1000-original_names.shape[1]), dtype = int)
+            padding_behaviors  = torch.unsqueeze(padding_behaviors, 0)
+            original_names     = torch.nn.functional.pad(input=original_names, pad=(0, (1000-original_names.shape[1])), mode='constant', value=0)
+            original_behaviors = torch.cat((original_behaviors, padding_behaviors), dim = 1)
+        else: 
+            original_names = original_names[:, :1000]
+            original_behaviors = original_behaviors[:, :1000*4]
+        
+
+        # Send data to device
+        original_names     = original_names.to(device)
+        original_behaviors = original_behaviors.to(device)
+
+        # Embed using the model ebedding layers
+        embedded_names = model.embedder1(original_names)
+        embedded_behaviors = model.embedder2(original_behaviors)
+
+
+        # Compute the Jacobian sign
+        position, sign_jacobian_names, sign_jacobian_behaviors = compute_jacobian(
+            model, embedded_names, embedded_behaviors, 
+            total_names, sample_name, position_ub)
+    
         # Repeat M times the Jacobian sign to allow fast difference computation
         # M = number of apis to try
         if mode == 'names':
@@ -397,30 +1037,6 @@ def adversarial_sequence_generation(api_sequence, model, api_set, mode, called_a
             embedded_behaviors = new_embedded_behaviors[selected_idx]
             embedded_behaviors = np.expand_dims(embedded_behaviors, axis = 0)
 
-            try:
-                # Compute the Jacobian sign
-                position, sign_jacobian_names, sign_jacobian_behaviors = compute_jacobian(
-                        model,
-                        torch.tensor(embedded_names).to(device), 
-                        torch.tensor(embedded_behaviors).to(device),
-                        total_names,
-                        sample_name,
-                        position_ub)
-            except CannotFindBestPositionException:
-                # If we cannot find a position to hijack, we stop and return just the first window
-                logger.warning(f'[{sample_name[:]}] Cannot find a position to hijack in the second window, returning only window 1')
-                apis_counter = len(list(filter(lambda x: x[0] == 1, total_names[:1000])))
-                output_name_sequence.append(total_names[:1000])
-                return apis_counter, output_name_sequence
-            
-            # Repeat M times the Jacobian sign to allow fast difference computation
-            # M = number of apis to try
-            sign_jacobian_names_repeated = np.repeat(sign_jacobian_names, len(api_set), axis = 0)
-            sign_jacobian_behaviors_repeated = np.repeat(sign_jacobian_behaviors, len(api_set), axis = 0)
-        
-            # Dynamically adjust the random upperbound
-            position_ub = position_ub + 1 if position_ub < 999 else 999
-
             # Update the total sequences
             total_names = np.concatenate((
                     total_names[:position],
@@ -430,8 +1046,40 @@ def adversarial_sequence_generation(api_sequence, model, api_set, mode, called_a
                     total_behaviors[:position],
                     np.array([(1, api_set_behavior_id[selected_idx])], dtype=object),
                     total_behaviors[position:]))
+            
+            #n = torch.tensor(list(map(lambda x: x[1], total_names[:1000]))).unsqueeze(0)
+            #b = torch.tensor(list(map(lambda x: x[1], total_behaviors[:1000]))).flatten().unsqueeze(0)
 
+            #print(f'single inference: {model.single_inference(embedded_names, embedded_behaviors)}')
+            #print(f'single inference: {model.single_inference(model.embedder1(n).detach().numpy(), model.embedder2(b).detach().numpy())}')
+            #print(f'single score: {model.single_score(embedded_names, embedded_behaviors)}')
+            #print(f'pred given split {model.pred_given_split(n, b)}')
+            #print(f'score given split {model.score_given_split(n, b)}')
+
+
+            # Compute the Jacobian sign
+            position, sign_jacobian_names, sign_jacobian_behaviors = compute_jacobian(
+                    model,
+                    torch.tensor(embedded_names).to(device), 
+                    torch.tensor(embedded_behaviors).to(device),
+                    total_names,
+                    sample_name,
+                    position_ub)
+     
+            
+            # Repeat M times the Jacobian sign to allow fast difference computation
+            # M = number of apis to try
+            sign_jacobian_names_repeated = np.repeat(sign_jacobian_names, len(api_set), axis = 0)
+            sign_jacobian_behaviors_repeated = np.repeat(sign_jacobian_behaviors, len(api_set), axis = 0)
+        
+            # Dynamically adjust the random upperbound
+            position_ub = position_ub + 1 if position_ub < 999 else 999
+
+            
         # Update the number of injected APIs counter
+        if apis_counter == max_num_iterations:
+            break
+
         apis_counter += len(list(filter(lambda x: x[0] == 1, total_names[:1000])))
         
         output_name_sequence.append(total_names[:1000])
@@ -456,15 +1104,16 @@ def adversarial_sequence_generation(api_sequence, model, api_set, mode, called_a
     if it_counter < max_num_iterations:
         #sys.stdout.write('\r' + f'Injected {apis_counter} new API calls' + ' ' * 100)
         #sys.stdout.flush()
-        ...
+        pass
     else:
         it_counter = 999999
         #sys.stdout.write('\r' + f'Fuck, too many APIs' + ' ' * 100)
         #sys.stdout.flush()
-        api_counter = -1
+        #api_counter = 999999
                              
     
     return apis_counter, output_name_sequence
+
 
 
 def random_adversarial_sequence_generation(api_sequence, model, api_set, mode, called_apis, sample_name, max_num_iterations=1500):
@@ -832,6 +1481,8 @@ def Rosenberg_adversarial_sequence_generation(api_sequence, model, api_set, mode
                     total_behaviors[position:]))
 
         # Update the number of injected APIs counter
+        if apis_counter == max_num_iterations:
+            break
         apis_counter += len(list(filter(lambda x: x[0] == 1, total_names[:1000])))
         
         output_name_sequence.append(total_names[:1000])
@@ -854,14 +1505,15 @@ def Rosenberg_adversarial_sequence_generation(api_sequence, model, api_set, mode
         position_ub = original_names.shape[1]
         
     if it_counter < max_num_iterations:
+        #print(it_counter)
         #sys.stdout.write('\r' + f'Injected {apis_counter} new API calls' + ' ' * 100)
         #sys.stdout.flush()
-        ...
+        pass
     else:
         it_counter = 999999
         #sys.stdout.write('\r' + f'Fuck, too many APIs' + ' ' * 100)
         #sys.stdout.flush()
-        api_counter = -1
+        #api_counter = 9999999
                              
     
     return apis_counter, output_name_sequence
@@ -903,7 +1555,7 @@ def test_set_attack(original_sequence, strategy):
                             
     Returns:
         adversarial_sequence (list): list containing the adversarial sequence
-     """
+    """
     global device
     global model
     # Set the paths
@@ -1021,14 +1673,18 @@ def attack(original_sequence):
         logger.warning(f"[{original_sample_name[:]}] Discarded - < {general_constant['min_valid_apis']} valid apis" )
         return (-3, original_sample_name)
     
-    # Load the model
-    if torch.cuda.is_available():
-        model = torch.load(model_path)
-    else:
-        model = torch.load(model_path, map_location=torch.device('cpu'))
+    if attack_strategy != 'combo_attack':
+        # Fix for when called by Colab
+        setattr(__main__, "Net", Net)
 
-    # Cast the model to the new defined class
-    model.__class__ = CustomNet
+        # Load the model
+        if torch.cuda.is_available():
+            model = torch.load(model_path)
+        else:
+            model = torch.load(model_path, map_location=torch.device('cpu'))
+
+        # Cast the model to the new defined class
+        model.__class__ = CustomNet
 
     # Restore the proper dimensionality
     original_names = np.expand_dims(original_names, axis=0)
@@ -1039,10 +1695,11 @@ def attack(original_sequence):
     original_import_filtered = helper_func(original_import_decoded)
 
     # Check if the sample is already classified as not malicious
-    prediction = model.pred_given_split(torch.tensor(original_names).to(device), torch.tensor(original_behaviors).to(device))
-    if prediction == 0:        
-        logger.warning(f'[{original_sample_name[:]}] Already classified as not malicious')
-        return (0, original_sample_name)
+    if not attack_strategy == 'combo_attack':
+        prediction = model.pred_given_split(torch.tensor(original_names).to(device), torch.tensor(original_behaviors).to(device))
+        if prediction == 0:        
+            logger.warning(f'[{original_sample_name[:]}] Already classified as not malicious')
+            return (0, original_sample_name)
     
     # Check if the sample imports a suffienct number of injectable APIs
     min_number_injectable_APIs = round(general_constant['threshold_imported_api']*len(chain_api_args.keys()))
@@ -1052,8 +1709,11 @@ def attack(original_sequence):
             return (-1, original_sample_name)
 
     # Concat names and behaviors to have am array of size (1, 5000)
-    test_x = np.concatenate([original_names, original_behaviors], 1)
-    test_x = torch.tensor(test_x)
+    if not attack_strategy == 'combo_attack':
+        test_x = np.concatenate([original_names, original_behaviors], 1)
+        test_x = torch.tensor(test_x)
+    else:
+        test_x = [torch.tensor(original_names), torch.tensor(original_behaviors)]
 
 
     # Start the attack
@@ -1064,12 +1724,25 @@ def attack(original_sequence):
             logger.critical(f'[{original_sample_name[:]}] Failed - {e} - {num_imported_apis} imported APIs' )
             return (-5, original_sample_name)
         # Check if the attack has been successfully completed
-        if apis_counter >= general_constant['max_it_number']:
-            logger.error(f"[{original_sample_name[:]}] Failed - {general_constant['max_it_number']} iterations reached - {num_imported_apis} imported APIs" )
+        if apis_counter >= general_constant['max_apis_to_inject']:
+            logger.error(f"[{original_sample_name[:]}] Failed - {general_constant['max_apis_to_inject']} iterations reached - {num_imported_apis} imported APIs" )
             return (-2, original_sample_name)
         
         logger.info(f'[{original_sample_name[:]}] OK - {apis_counter} added APIs - {num_valid_apis} valid APIs - {num_imported_apis} imported APIs' )
-
+    
+    elif attack_strategy == 'combo_attack':
+        try:
+            apis_counter, name_sequence = combo_adversarial_sequence_generation(test_x, model, original_import_filtered, 'names', original_called, original_sample_name, general_constant['max_it_number'])
+        except CannotFindBestPositionException as e:
+            logger.critical(f'[{original_sample_name[:]}] Failed - {e} - {num_imported_apis} imported APIs' )
+            return (-5, original_sample_name)
+        # Check if the attack has been successfully completed
+        if apis_counter >= general_constant['max_apis_to_inject']:
+            logger.error(f"[{original_sample_name[:]}] Failed - {general_constant['max_apis_to_inject']} iterations reached - {num_imported_apis} imported APIs" )
+            return (-2, original_sample_name)
+        
+        logger.info(f'[{original_sample_name[:]}] OK - {apis_counter} added APIs - {num_valid_apis} valid APIs - {num_imported_apis} imported APIs' )
+    
     elif attack_strategy == 'random_attack':
         try:
             apis_counter, name_sequence = random_adversarial_sequence_generation(test_x, model, original_import_filtered, 'names', original_called, original_sample_name, general_constant['max_it_number'])
@@ -1089,8 +1762,301 @@ def attack(original_sequence):
     # sys.stdout.write('before write result')
     # sys.stdout.flush()
     if attack_strategy == 'attack':
-        write_result(name_sequence, original_sample_name)    
+        write_result(name_sequence, original_sample_name)
+    elif attack_strategy == 'combo_attack':
+        return (apis_counter, name_sequence)
     # sys.stdout.write('after write result')
     # sys.stdout.flush()
 
     return (apis_counter, original_sample_name)
+
+
+def stats_on_imported(original_sequence):
+    original_sample_name = original_sequence[3]
+    original_import = original_sequence[2]
+
+    # Decode and filter the list of imported APIs
+    original_import_decoded  = convert_to_string(original_import)
+    original_import_filtered = helper_func(original_import_decoded)
+
+    return original_sample_name, len(original_import_filtered)
+
+
+
+def find_max_score(original_sequences):
+    '''
+    Function to evaluate different executions of the same sample and return the
+    one with the highest confidence score of the model
+
+    Args:
+        original_sequences (list): list containing the original sequences of different
+        executions of the same sample                        
+    Returns:
+       index of the sequence with the highest confidence score
+    '''
+    scores = []
+    for original_sequence in original_sequences:
+        original_names = original_sequence[0]
+        original_behaviors = original_sequence[1]
+
+        # Restore the proper dimensionality
+        original_names = np.expand_dims(original_names, axis=0)
+        original_behaviors = np.expand_dims(original_behaviors, axis=0)
+        
+        # Check if the sequence is greater than 1000
+        if original_names.shape[1] > 1000:
+            # Split the sequence in windows of 1000 APIs
+            original_names = np.split(original_names, np.arange(1000, original_names.shape[1], 1000), axis = 1)
+            original_behaviors = np.split(original_behaviors, np.arange(4000, original_behaviors.shape[1], 4000), axis = 1)
+            
+            # Consider the maximum score among the windows
+            max_score = 0
+            for names, behaviors in zip(original_names, original_behaviors):
+                names = torch.tensor(names)
+                behaviors = torch.tensor(behaviors)
+
+                # Add padding to the sequences
+                padding_behaviors  = torch.tensor([24, 14, 14, 14] * (1000-names.shape[1]), dtype = int)
+                padding_behaviors  = torch.unsqueeze(padding_behaviors, 0)
+                names     = torch.nn.functional.pad(input=names, pad=(0, (1000-names.shape[1])), mode='constant', value=0)
+                behaviors = torch.cat((behaviors, padding_behaviors), dim = 1)
+
+                
+                score = model.score_given_split(names.to(device), behaviors.to(device))
+                #print(f'score {score}')
+                if score > max_score:
+                    max_score = score
+            scores.append(max_score)
+
+        else:
+            scores.append(model.score_given_split(torch.tensor(original_names).to(device), torch.tensor(original_behaviors).to(device)))
+    #print(f'scores {scores}')
+    if all(score <= 0.5 for score in scores):
+        return -1
+
+    return scores.index(max(scores))
+
+
+def update_sequence_with_injected_apis(original_sequence, called_apis, api_dict):
+    '''
+    Function to update the original sequence of API calls with the injections
+    returned by the adversarial attack
+
+    Args:
+        original_sequence (list): list containing the original sequence of API calls                            
+    Returns:
+        adversarial_sequence_names (list): list containing the adversarial sequence names
+        adversarial_sequence_behaviors (list): list containing the adversarial sequence behaviors
+        info_list (list): list containing the info about the injected APIs
+    '''
+
+    '''
+    info_list structure:
+    [None, None, ..., None, (hijacked_api, occurence, offset), None, ..., None]
+    hijacked_api: the API that has been hijacked
+    occurence: the occurence of the hijacked API in the original sequence
+    offset: offset of the current injected API in the sequence of APIs injected for 
+            the current hijacked API
+    0 if loader
+    '''
+
+    adversarial_sequence_names = [] # list to store the adversarial sequence names
+    inspected_api_dict = {} # dict to store the inspected APIs
+    info_list = [] # list to store the info about the injected APIs
+
+
+    for api in original_sequence:
+        if id2word[int(api)].encode() not in called_apis:
+            info_list.append(0)
+            adversarial_sequence_names.append(api)
+            continue
+
+        # Update the inspected API dict
+        if api not in inspected_api_dict.keys():
+            inspected_api_dict[api] = 0
+        else:
+            inspected_api_dict[api] += 1
+        
+        # Add the injections to the adversarial sequence
+        if api in api_dict.keys():
+            occurence = inspected_api_dict[api]
+            for injection_couple in api_dict[api]:
+                if occurence == injection_couple[0]:
+                    adversarial_sequence_names += list(map(lambda x: word2id[x], injection_couple[1]))
+                    for i in range(len(injection_couple[1])):
+                        info_list.append((api, occurence, i))
+
+        # Add the original API to the adversarial sequence
+        adversarial_sequence_names.append(api)
+        info_list.append(None)
+
+    return adversarial_sequence_names,behaviors_from_id_name(adversarial_sequence_names).flatten(), info_list
+
+
+def update_combo_api_dict(old_api_dict, current_api_dict, current_sequence, current_info_list):
+    '''
+    Function to update the dict of API to inject with the injections of the last run 
+    '''
+    
+    inspected_api_dict = {} # dict to store the inspected APIs refered to the original sequence
+    fake_inspected_api_dict = {} # dict to store the inspected APIs refered to the new sequence
+    modified_hijacking_dict = {} # dict to store the modified hijacking APIs
+
+
+    for i, api in enumerate(current_sequence):
+
+        if current_info_list[i] == 0:
+            # If 0, the API is a loader
+            continue
+
+        if current_info_list[i] == None:
+            # Update the inspected API dict (occurence counter)
+            if api not in inspected_api_dict.keys():
+                inspected_api_dict[api] = 0
+            else:
+                inspected_api_dict[api] += 1
+        
+        if api not in fake_inspected_api_dict.keys():
+            fake_inspected_api_dict[api] = 0
+        else:
+            fake_inspected_api_dict[api] += 1
+
+        if api in current_api_dict.keys():
+            # The API must bi hijacked
+            if current_info_list[i] == None:
+                # If None, the API to hijack is not an injected API in a previous step       
+
+                for injection_couple in current_api_dict[api]:
+                    
+                    # Check if the occurence is the right one
+                    if injection_couple[0] != fake_inspected_api_dict[api]:
+                        continue
+
+                    if api not in old_api_dict.keys():
+                        # If the API is not present in the old dict, create it
+                        old_api_dict[api] = []
+
+                    # If the occurence is already present, update the list of injections
+                    list_copy = old_api_dict[api]
+                    old_api_dict[api] = []  
+                    modified = False
+                    for cc in list_copy:
+                        if cc[0] == inspected_api_dict[api]:
+                            old_api_dict[api].append((cc[0], 
+                                                    cc[1] + injection_couple[1]))
+                            modified = True
+                        else:
+                            old_api_dict[api].append(cc)
+                    if not modified:
+                        # If the occurence is not present, add it
+                        old_api_dict[api].append((inspected_api_dict[api], injection_couple[1]))
+            else:
+                hijacked_api = current_info_list[i][0]
+                occurence = current_info_list[i][1]
+                offset = current_info_list[i][2]
+
+                # Update the modified hijacking dict and compute the new offset due to previous
+                # modifications of the same hijacked API
+                if str(hijacked_api)+str(occurence) not in modified_hijacking_dict.keys():
+                    modified_hijacking_dict[str(hijacked_api)+str(occurence)] = len(current_api_dict[api])
+                else:
+                    offset += modified_hijacking_dict[str(hijacked_api)+str(occurence)]
+                    modified_hijacking_dict[str(hijacked_api)+str(occurence)] += len(current_api_dict[api])
+
+                for injection_couple in current_api_dict[api]:
+                    
+                    # Check if the occurence is the right one
+                    if injection_couple[0] != fake_inspected_api_dict[api]:
+                        continue
+
+                    new_data = []
+                    for cc in old_api_dict[hijacked_api]:
+                        if cc[0] != occurence:    
+                            new_data.append(cc)
+                        else:
+                            new_data.append((occurence, 
+                                            cc[1][:offset] + 
+                                            injection_couple[1] + 
+                                            cc[1][offset:])) 
+                    old_api_dict[hijacked_api] = new_data
+    return old_api_dict
+
+
+def combo_attack(original_sequences):
+    global model
+
+    # Get the logger
+    logger = logging.getLogger('adversarial_attack')
+    
+    # Set the paths
+    set_paths()
+
+    # Fix for when called by Colab
+    setattr(__main__, "Net", Net)
+
+    # Load the model
+    if torch.cuda.is_available():
+        model = torch.load(model_path)
+    else:
+        model = torch.load(model_path, map_location=torch.device('cpu'))
+
+    # Cast the model to the new defined class
+    model.__class__ = CustomNet
+
+    # Initilize the counter of the number of APIs injected
+    final_apis_counter = 0
+
+    # Initialize the disct of APIs to inject
+    final_api_dict = {}
+
+    # Initialize the list of info_list
+    info_lists = []
+    for original_sequence in original_sequences:
+        total_names = list(map(lambda x: 0 if id2word[int(x)].encode() not in original_sequence[4] else None, original_sequence[0]))
+        info_lists.append(total_names)
+    
+    # Initialize the list of new sequences
+    new_sequences = original_sequences
+    
+    # Initialize the set of APIs to inject
+    final_set_api_dict = set([])
+
+    index = 0
+    while index != -1 and final_apis_counter < general_constant['max_apis_to_inject']:
+
+        # Get the execution with the highest confidence score
+        index = find_max_score(new_sequences)
+
+
+        # Attack the sample
+        apis_counter, name_sequence = attack(new_sequences[index])
+
+        if apis_counter < 0:
+            return (apis_counter, new_sequences[0][3])
+                
+        # Update the number of injected APIs counter
+        final_apis_counter += apis_counter
+
+        # Produce the words and flags sequences produced by the attack strategy
+        words_sequence, flags_sequence = convert_id_seq_to_word_seq(name_sequence)
+        
+        # Produce the dict of API to inject
+        api_dict, set_api_dict = create_injection_dict(words_sequence, flags_sequence)
+        final_set_api_dict = final_set_api_dict.union(set_api_dict)
+        # Transform the keys of the dict from words to ids
+        api_dict = {new_key: api_dict[old_key] for old_key, new_key in zip(api_dict.keys(), map(lambda x: word2id[x], api_dict.keys()))}
+
+        # Update the dict of APIs to inject
+        #print(f'New execution {api_dict}')
+        final_api_dict = update_combo_api_dict(final_api_dict, api_dict, new_sequences[index][0], info_lists[index])
+        #print(f'New combo {final_api_dict}')
+
+        # Update the original sequences with the injected APIs
+        for i, original_sequence in enumerate(original_sequences):
+            adversarial_names, adversarial_behaviors, new_info_list = update_sequence_with_injected_apis(original_sequence[0], original_sequence[4], final_api_dict)
+            new_sequences[i] = (adversarial_names, adversarial_behaviors, original_sequence[2], original_sequence[3], original_sequence[4], original_sequence[5])
+            info_lists[i] = new_info_list
+        
+    final_api_dict = {new_key: final_api_dict[old_key] for old_key, new_key in zip(final_api_dict.keys(), map(lambda x: id2word[x], final_api_dict.keys()))}
+    write_combo_result(final_api_dict, final_set_api_dict, original_sequences[0][3])
+    return final_apis_counter, original_sequences[0][3]            

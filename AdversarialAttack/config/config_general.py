@@ -1,9 +1,11 @@
 general_constant = {
     # threshold to determine when discard the sample because it imports few APIs that we can inject
     "threshold_imported_api": 0.01,
+    "max_apis_to_inject": 1200, # max number of APIs to inject
     "max_it_number": 600, # max number of iterations for the attack
     "n_pools": 3, # number of pools to use for the attack
-    "min_valid_apis": 75, # min number of APIs that a sequence must contain
+    "min_valid_apis": 15, # min number of APIs that a sequence must contain
+    "score_threshold": 0.5, # threshold for the score of the model for the attack
 
     # List of APIs that we can inject
     "apis_we_can_inject":  ["HttpOpenRequestW", "WSASocketA", "RegOpenKeyExW", "RemoveDirectoryA", 

@@ -114,6 +114,42 @@ class CustomNet(Net):
         pred = 1 if pred >= 0.5 else 0
         return pred
     
+    def single_inference_thr(self, name_embeddings, behavior_embeddings):
+        self.eval() # set the eval switch
+
+        # From Numpy to Tensor
+        name_embeddings = torch.from_numpy(name_embeddings)
+        behavior_embeddings = torch.from_numpy(behavior_embeddings)
+
+        # Send data to the device
+        name_embeddings = name_embeddings.to(device)
+        behavior_embeddings = behavior_embeddings.to(device)
+
+        # pred = self.diff_forward(name_embeddings, behavior_embeddings)[0][0]
+        pred = self.diff_forward(name_embeddings, behavior_embeddings)
+        pred = F.sigmoid(pred)
+        pred_ = 1 if pred >= 0.001 else 0
+        if pred_ == 0:
+            print('--------------------')
+            print(pred)
+        return pred_
+    
+    def single_score(self, name_embeddings, behavior_embeddings):
+        self.eval() # set the eval switch
+
+        # From Numpy to Tensor
+        name_embeddings = torch.from_numpy(name_embeddings)
+        behavior_embeddings = torch.from_numpy(behavior_embeddings)
+
+        # Send data to the device
+        name_embeddings = name_embeddings.to(device)
+        behavior_embeddings = behavior_embeddings.to(device)
+
+        # pred = self.diff_forward(name_embeddings, behavior_embeddings)[0][0]
+        pred = self.diff_forward(name_embeddings, behavior_embeddings)
+        pred = F.sigmoid(pred)
+        return pred
+    
     def pred_given_split(self, x_name, x_behavior):
         x_name = self.embedder1(x_name)
         x_behavior = self.embedder2(x_behavior)
@@ -144,4 +180,35 @@ class CustomNet(Net):
         x = F.dropout(x, p=0.2, training=self.training)
         x = F.sigmoid(self.lin3(x))  
         x = 1 if x >= 0.5 else 0
+        return x        
+    
+    def score_given_split(self, x_name, x_behavior):
+        x_name = self.embedder1(x_name)
+        x_behavior = self.embedder2(x_behavior)
+
+        x_name = x_name.unsqueeze(1)
+        x_behavior = x_behavior.unsqueeze(1)
+
+        pad = ZeroPad2d(padding=(0, 0, 2, 1))
+        x_name_pad = pad(x_name)
+
+        x_name_cnn1 = F.relu(self.cnn1_1(x_name)).squeeze(-1).permute(0, 2, 1)
+        x_name_cnn2 = F.relu(self.cnn1_2(x_name_pad)).squeeze(-1).permute(0, 2, 1)
+        x_name_cnn3 = F.relu(self.cnn1_3(x_name)).squeeze(-1).permute(0, 2, 1)
+
+        x_behavior = F.relu(self.cnn2(x_behavior)).squeeze(-1).permute(0, 2, 1)
+
+        x = torch.cat([x_name_cnn1, x_name_cnn2, x_name_cnn3, x_behavior], dim=-1)
+
+        x, (h_n, c_n) = self.lstm(x)
+
+        output_fw = h_n[-2, :, :]
+        output_bw = h_n[-1, :, :]
+
+        x = torch.cat([output_fw, output_bw], dim=-1)
+        x = F.relu(self.lin1(x))
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = F.relu(self.lin2(x))
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = F.sigmoid(self.lin3(x))  
         return x        

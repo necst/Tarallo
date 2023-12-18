@@ -93,7 +93,6 @@ def create_hijacking_data(api_dict, set_api):
         hijacking_data.append([api_to_hijack.encode(), data_to_inject, len(data_to_inject)-len(control_data)])
     return hijacking_data, enumerated_set_api
 
-
 def write_result(name_sequence, sample_name):
     """
     Function to manage the writing on file of the data produced by the attack in 
@@ -104,6 +103,35 @@ def write_result(name_sequence, sample_name):
     
     # Produce the dict of API to inject
     api_dict, set_api = create_injection_dict(words_sequence, flags_sequence)
+    
+    # Produce the hijacking data to give to the framework
+    hijacking_data, enumerated_set_api = create_hijacking_data(api_dict, set_api)
+
+    if not os.path.exists(general_paths['hijacking_data_dir']):
+        os.makedirs(general_paths['hijacking_data_dir'])
+
+    with open(os.path.join(general_paths['hijacking_data_dir'], 'start_time'), 'r') as f:
+        start_time_string = f.readline()
+
+    if not os.path.exists(os.path.join(general_paths['hijacking_data_dir'], 'pickles_'+start_time_string)):
+        os.makedirs(os.path.join(general_paths['hijacking_data_dir'], 'pickles_'+start_time_string))
+
+    # Write the hijacking data in a file as PICKLE
+    filename = f'hijacking_data_{sample_name}.pkl'
+    file_path = os.path.join(general_paths['hijacking_data_dir'], 'pickles_'+start_time_string, filename)
+    pickle.dump(hijacking_data, open(file_path, 'wb'))
+
+    # Write the set api used in a file as PICKLE
+    filename = f'enumerated_set_api_{sample_name}.pkl'
+    file_path = os.path.join(general_paths['hijacking_data_dir'], 'pickles_'+start_time_string, filename)
+    pickle.dump(enumerated_set_api, open(file_path, 'wb'))
+
+
+def write_combo_result(api_dict, set_api, sample_name):
+    """
+    Function to manage the writing on file of the data produced by the combo attack in 
+    a format that can be used by the patcher
+    """
     
     # Produce the hijacking data to give to the framework
     hijacking_data, enumerated_set_api = create_hijacking_data(api_dict, set_api)
